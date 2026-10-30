@@ -657,12 +657,7 @@ class MainWindow(QMainWindow):
                 f"Failed during meta-data correlation process:\n{str(e)}"
             )
 
-    def _on_pairwise_comparison(self):
-        """Placeholder handler for pair-wise comparison analysis."""
-        if not self.is_project_loaded:
-            QMessageBox.warning(self, "No Project", "Please create or load a project first.")
-            return
-        pass
+
 
     def _on_likert_rating(self):
         """Initializes the Likert rating workflow, presenting randomized image sets, 
@@ -1096,8 +1091,519 @@ class MainWindow(QMainWindow):
                 self, "Error",
                 f"Failed to save Likert results:\n{str(e)}"
             )
+    
 
-def _reset_main_window_view(self):
+    def _on_pairwise_comparison(self):
+        """Initializes the Pair-wise Comparison workflow with robust path handling."""
+        from pathlib import Path
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QLineEdit, QDialogButtonBox, QMessageBox
+
+        if not self.is_project_loaded or not self.current_project_path:
+            QMessageBox.warning(self, "No Project", "Please create or load a project first.")
+            return
+
+        # Ensure project path is a pathlib.Path object
+        self.current_project_path = Path(self.current_project_path)
+
+        # 1. Gather image sets
+        image_sets = sorted([
+            p.name for p in self.current_project_path.iterdir() 
+            if p.is_dir() and p.name.startswith("Image set")
+        ])
+        
+        n_items = len(image_sets)
+        if n_items < 2:
+            QMessageBox.warning(self, "Insufficient Data", "Pair-wise comparison requires at least 2 image sets.")
+            return
+
+        est_min_comparisons = n_items * 6
+        est_max_comparisons = n_items * 12
+
+        # 2. Popup dialog for Evaluator Name
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Pair-wise Comparison Setup")
+        dialog.resize(400, 220)
+        form_layout = QVBoxLayout(dialog)
+
+        form_layout.addWidget(QLabel("Enter Evaluator Name:"))
+        evaluator_input = QLineEdit()
+        form_layout.addWidget(evaluator_input)
+
+        info_text = (
+            f"Loaded Image Sets: {n_items}\n"
+            f"Expected Comparisons: ~{est_min_comparisons} to {est_max_comparisons}\n"
+            "Evaluations adaptively converge using the Bradley-Terry model."
+        )
+        info_label = QLabel(info_text)
+        info_label.setStyleSheet("color: #a0a0a0; font-size: 12px; margin: 8px 0;")
+        form_layout.addWidget(info_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form_layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        evaluator_name = evaluator_input.text().strip()
+        if not evaluator_name:
+            QMessageBox.warning(self, "Invalid Input", "Evaluator name cannot be empty.")
+            return
+
+        self.pairwise_evaluator = evaluator_name
+        self.pairwise_items = image_sets
+
+        # 3. Define file paths explicitly
+        results_dir = self.current_project_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.pairwise_state_file = self.current_project_path / f"bt_sorting_state_{evaluator_name}.csv"
+        self.pairwise_result_file = results_dir / f"Pairwise_{evaluator_name}.csv"
+
+        print(f"[Debug] State file path: {self.pairwise_state_file.resolve()}")
+
+        # 4. Check for existing state/results and ask to resume
+        if self.pairwise_state_file.exists():
+            reply = QMessageBox.question(
+                self, "Resume Session",
+                f"Found previous evaluation state for '{evaluator_name}'.\nDo you want to continue from where you left off?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply == QMessageBox.No:
+                self.pairwise_state_file.unlink()
+
+        # 5. Initialize Bradley-Terry matrices and UI
+        self._init_bradley_terry_state()
+        self._build_pairwise_ui()
+        self._load_next_pairwise_pair()
+
+    def _init_bradley_terry_state(self):
+        """Initializes or loads Bradley-Terry win/match matrices, comparison count, and stability state."""
+        import csv
+        
+        n = len(self.pairwise_items)
+        self.item_to_idx = {item: i for i, item in enumerate(self.pairwise_items)}
+        
+        # Default priors / fresh session defaults
+        self.bt_wins = [[0.1]*n for _ in range(n)]
+        self.bt_matches = [[0.2]*n for _ in range(n)]
+        for i in range(n):
+            self.bt_wins[i][i] = 0.0
+            self.bt_matches[i][i] = 0.0
+
+        self.bt_comparisons = 0
+        self.bt_previous_ranking = list(self.pairwise_items)
+        self.bt_stable_streak = 0
+
+        # Load from state file if exists
+        if self.pairwise_state_file.exists():
+            try:
+                with open(self.pairwise_state_file, mode='r', newline='', encoding='utf-8') as f:
+                    reader = list(csv.reader(f))
+                if reader:
+                    saved_items = reader[0][1:]
+                    saved_item_to_idx = {item: i for i, item in enumerate(saved_items)}
+                    
+                    wins_raw, matches_raw = [], []
+                    mode = None
+                    for row in reader:
+                        if not row: continue
+                        if row[0] == "COMPARISONS":
+                            self.bt_comparisons = int(row[1])
+                            continue
+                        elif row[0] == "STABLE_STREAK":
+                            self.bt_stable_streak = int(row[1])
+                            continue
+                        elif row[0] == "PREVIOUS_RANKING":
+                            self.bt_previous_ranking = row[1:]
+                            continue
+                        elif row[0] == "WINS_MATRIX": 
+                            mode = "wins"
+                            continue
+                        elif row[0] == "MATCHES_MATRIX": 
+                            mode = "matches"
+                            continue
+                            
+                        if mode == "wins": 
+                            wins_raw.append([float(x) for x in row])
+                        elif mode == "matches": 
+                            matches_raw.append([float(x) for x in row])
+
+                    # Map back to current items if matrices were successfully loaded
+                    if wins_raw and matches_raw:
+                        for i, item_i in enumerate(self.pairwise_items):
+                            if item_i in saved_item_to_idx:
+                                old_i = saved_item_to_idx[item_i]
+                                for j, item_j in enumerate(self.pairwise_items):
+                                    if item_j in saved_item_to_idx:
+                                        old_j = saved_item_to_idx[item_j]
+                                        self.bt_wins[i][j] = wins_raw[old_i][old_j]
+                                        self.bt_matches[i][j] = matches_raw[old_i][old_j]
+            except Exception as e:
+                print(f"Error loading state: {e}")
+
+        # Compute initial scores
+        self._update_bt_scores()
+
+    def _update_bt_scores(self):
+        """Runs iterative maximum likelihood estimation for Bradley-Terry scores (p)."""
+        n = len(self.pairwise_items)
+        self.bt_p = [1.0] * n
+        
+        total_matches = sum(sum(row) for row in self.bt_matches)
+        if total_matches == 0:
+            return
+
+        for _ in range(40):
+            new_p = [0.0] * n
+            for i in range(n):
+                total_wins_i = sum(self.bt_wins[i])
+                denominator = 0.0
+                for j in range(n):
+                    if i != j and self.bt_matches[i][j] > 0:
+                        denominator += self.bt_matches[i][j] / max(self.bt_p[i] + self.bt_p[j], 1e-9)
+                if denominator > 0:
+                    new_p[i] = total_wins_i / denominator
+                else:
+                    new_p[i] = self.bt_p[i]
+            norm = sum(new_p)
+            if norm > 0:
+                self.bt_p = [max(val / norm, 1e-6) for val in new_p]
+
+    def _build_pairwise_ui(self):
+        """Constructs the side-by-side DICOM viewing window layout with bottom choice panel and keyboard shortcuts."""
+        from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame
+        from PySide6.QtGui import QKeySequence, QShortcut
+        from PySide6.QtCore import Qt
+
+        central_widget = QWidget(self)
+        central_widget.setStyleSheet("background-color: #121212;")
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Header Info Label
+        self.pairwise_info_label = QLabel()
+        self.pairwise_info_label.setStyleSheet("color: #e0e0e0; font-weight: bold; font-size: 14px;")
+        main_layout.addWidget(self.pairwise_info_label)
+
+        # Side-by-Side Viewers Layout
+        viewers_layout = QHBoxLayout()
+        
+        # Left Viewer Panel
+        left_panel = QVBoxLayout()
+        self.pairwise_label1 = QLabel("Image A")
+        self.pairwise_label1.setStyleSheet("color: #3498db; font-weight: bold; font-size: 13px;")
+        left_panel.addWidget(self.pairwise_label1)
+        
+        self.viewer1 = DICOMImageView("pairwise_left", self)
+        left_panel.addWidget(self.viewer1, stretch=1)
+        viewers_layout.addLayout(left_panel)
+
+        # Right Viewer Panel
+        right_panel = QVBoxLayout()
+        self.pairwise_label2 = QLabel("Image B")
+        self.pairwise_label2.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 13px;")
+        right_panel.addWidget(self.pairwise_label2)
+        
+        self.viewer2 = DICOMImageView("pairwise_right", self)
+        right_panel.addWidget(self.viewer2, stretch=1)
+        viewers_layout.addLayout(right_panel)
+
+        main_layout.addLayout(viewers_layout, stretch=4)
+
+        # Bottom Choice & Control Panel
+        control_frame = QFrame()
+        control_frame.setStyleSheet("""
+            QFrame {
+                background-color: #1e1e1e;
+                border: 1px solid #2d2d2d;
+                border-radius: 8px;
+                padding: 10px;
+            }
+            QPushButton {
+                background-color: #2c3e50;
+                color: #ffffff;
+                border: 1px solid #3d4f61;
+                border-radius: 4px;
+                padding: 10px 20px;
+                font-weight: bold;
+                font-size: 13px;
+                min-width: 140px;
+            }
+            QPushButton:hover {
+                background-color: #34495e;
+            }
+            QPushButton#saveExitBtn {
+                background-color: #c0392b;
+                border: 1px solid #e74c3c;
+            }
+            QPushButton#saveExitBtn:hover {
+                background-color: #e74c3c;
+            }
+        """)
+        control_layout = QHBoxLayout(control_frame)
+        control_layout.setAlignment(Qt.AlignCenter)
+
+        self.btn_choice1 = QPushButton("[1] Image A is Better")
+        self.btn_choice1.clicked.connect(lambda: self._handle_pairwise_choice(True))
+        
+        self.btn_choice2 = QPushButton("[2] Image B is Better")
+        self.btn_choice2.clicked.connect(lambda: self._handle_pairwise_choice(False))
+
+        self.btn_save_exit = QPushButton("Save & Exit ([q])")
+        self.btn_save_exit.setObjectName("saveExitBtn")
+        self.btn_save_exit.clicked.connect(self._save_and_exit_pairwise)
+
+        control_layout.addWidget(self.btn_choice1)
+        control_layout.addSpacing(15)
+        control_layout.addWidget(self.btn_choice2)
+        control_layout.addSpacing(30)
+        control_layout.addWidget(self.btn_save_exit)
+
+        main_layout.addWidget(control_frame)
+        self.setCentralWidget(central_widget)
+
+        # ==========================================
+        # KEYBOARD SHORTCUT BINDINGS
+        # ==========================================
+        self.shortcut_1 = QShortcut(QKeySequence("1"), self)
+        self.shortcut_1.activated.connect(lambda: self._handle_pairwise_choice(True))
+
+        self.shortcut_2 = QShortcut(QKeySequence("2"), self)
+        self.shortcut_2.activated.connect(lambda: self._handle_pairwise_choice(False))
+
+        self.shortcut_q = QShortcut(QKeySequence("q"), self)
+        self.shortcut_q.activated.connect(self._save_and_exit_pairwise)
+
+    def _load_next_pairwise_pair(self):
+        """Picks the next pair using uncertainty-weighted priority pairing and loads them into viewers."""
+        import random
+        import numpy as np
+        import pydicom
+
+        items = self.pairwise_items
+        n = len(items)
+        bt_scores = {items[i]: self.bt_p[i] for i in range(n)}
+        match_counts = {items[i]: sum(self.bt_matches[i]) for i in range(n)}
+
+        # Uncertainty-weighted pairing logic
+        sorted_items = sorted(items, key=lambda x: bt_scores[x], reverse=True)
+        weights = [1.0 / (match_counts[item] + 1.0) for item in sorted_items]
+        total_weight = sum(weights)
+        probabilities = [w / total_weight for w in weights]
+        
+        item1 = random.choices(sorted_items, weights=probabilities, k=1)[0]
+        idx1 = sorted_items.index(item1)
+        
+        window = 2
+        low_bound = max(0, idx1 - window)
+        high_bound = min(n - 1, idx1 + window)
+        neighbors = [sorted_items[i] for i in range(low_bound, high_bound + 1) if sorted_items[i] != item1]
+        if not neighbors:
+            neighbors = [item for item in sorted_items if item != item1]
+            
+        item2 = random.choice(neighbors)
+
+        self.current_pair = (item1, item2)
+
+        # Load DICOM volume for item1 into viewer1
+        self._load_dicom_into_viewer(item1, self.viewer1)
+        # Load DICOM volume for item2 into viewer2
+        self._load_dicom_into_viewer(item2, self.viewer2)
+
+        self.pairwise_label1.setText(f"[1] {item1}")
+        self.pairwise_label2.setText(f"[2] {item2}")
+        self.pairwise_info_label.setText(
+            f"Evaluator: {self.pairwise_evaluator} | Comparisons: {self.bt_comparisons}"
+        )
+
+    def _load_dicom_into_viewer(self, set_name, viewer):
+        """Helper to load and render DICOM volume slices with Hounsfield Units & W/L."""
+        import pydicom
+        import numpy as np
+
+        set_dir = self.current_project_path / set_name
+        dcm_files = sorted([f for f in set_dir.iterdir() if f.is_file()])
+        if not dcm_files:
+            return
+
+        slices = []
+        window_center, window_width = None, None
+
+        for idx, file_path in enumerate(dcm_files):
+            try:
+                ds = pydicom.dcmread(file_path)
+                if hasattr(ds, "pixel_array"):
+                    slope = float(getattr(ds, "RescaleSlope", 1.0))
+                    intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+                    img_array = ds.pixel_array.astype(np.float32) * slope + intercept
+                    slices.append(img_array)
+
+                    if idx == 0 and hasattr(ds, "WindowCenter") and hasattr(ds, "WindowWidth"):
+                        wc, ww = ds.WindowCenter, ds.WindowWidth
+                        if isinstance(wc, (list, pydicom.multival.MultiValue)): wc = wc[0]
+                        if isinstance(ww, (list, pydicom.multival.MultiValue)): ww = ww[0]
+                        window_center, window_width = float(wc), float(ww)
+            except Exception:
+                pass
+
+        if slices:
+            volume = np.stack(slices, axis=0)
+            volume = np.transpose(volume, (0, 2, 1)) # Orient for pyqtgraph
+            viewer.setImage(volume)
+            if window_center is not None and window_width is not None:
+                viewer.setLevels(window_center - window_width / 2.0, window_center + window_width / 2.0)
+
+
+    def _handle_pairwise_choice(self, item1_wins):
+        """Processes the user's comparison choice, updates Bradley-Terry matrix, saves state, and checks convergence."""
+        item1, item2 = self.current_pair
+        idx1 = self.item_to_idx[item1]
+        idx2 = self.item_to_idx[item2]
+
+        self.bt_comparisons += 1
+        self.bt_matches[idx1][idx2] += 1
+        self.bt_matches[idx2][idx1] += 1
+
+        if item1_wins:
+            self.bt_wins[idx1][idx2] += 1
+        else:
+            self.bt_wins[idx2][idx1] += 1
+
+        self._update_bt_scores()
+
+        # Automatically save intermediate state after every choice
+        self._save_pairwise_state()
+
+        # Convergence & Stability check every 5 comparisons
+        if self.bt_comparisons % 5 == 0:
+            n = len(self.pairwise_items)
+            current_ranking = [self.pairwise_items[i] for i in sorted(range(n), key=lambda x: self.bt_p[x], reverse=True)]
+            rho = self._calculate_spearman_rho(self.bt_previous_ranking, current_ranking)
+            
+            min_matches = min(sum(self.bt_matches[i]) for i in range(n))
+            if min_matches >= 8 and rho >= 0.88:
+                self.bt_stable_streak += 1
+                if self.bt_stable_streak >= 3:
+                    QMessageBox.information(self, "Convergence Achieved", "Rankings have thoroughly stabilized!")
+                    self._finalize_pairwise_results()
+                    return
+            else:
+                self.bt_stable_streak = 0
+            self.bt_previous_ranking = current_ranking
+
+        # Load next pair
+        self._load_next_pairwise_pair()
+
+    def _calculate_spearman_rho(self, ranking_old, ranking_new):
+        """Calculates rank correlation between successive iterations."""
+        n = len(ranking_new)
+        if n <= 1: return 1.0
+        old_ranks = {item: idx for idx, item in enumerate(ranking_old)}
+        new_ranks = {item: idx for idx, item in enumerate(ranking_new)}
+        d_squared_sum = sum((old_ranks[item] - new_ranks[item]) ** 2 for item in ranking_new)
+        return 1 - (6 * d_squared_sum) / (n * (n**2 - 1))
+
+    def _save_pairwise_state(self):
+        """Saves current sorting state, matrices, comparison count, and stability streak to CSV."""
+        import csv
+        try:
+            with open(self.pairwise_state_file, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                # Save item list
+                writer.writerow(["ITEMS"] + list(map(str, self.pairwise_items)))
+                # Save progress metrics
+                writer.writerow(["COMPARISONS", self.bt_comparisons])
+                writer.writerow(["STABLE_STREAK", self.bt_stable_streak])
+                writer.writerow(["PREVIOUS_RANKING"] + list(map(str, self.bt_previous_ranking)))
+                # Save wins matrix
+                writer.writerow(["WINS_MATRIX"])
+                for row in self.bt_wins: 
+                    writer.writerow(row)
+                # Save matches matrix
+                writer.writerow(["MATCHES_MATRIX"])
+                for row in self.bt_matches: 
+                    writer.writerow(row)
+            print(f"[State Saved] Successfully wrote to {self.pairwise_state_file.resolve()}")
+        except Exception as e:
+            print(f"[Error] Failed to save state: {e}")
+
+    def _save_and_exit_pairwise(self):
+        """Saves current state and exits back to main dashboard."""
+        self._save_pairwise_state()
+        QMessageBox.information(self, "State Saved", "Progress successfully saved. You can resume anytime.")
+        self._reset_main_window_view()
+
+    def _finalize_pairwise_results(self):
+        """Computes final Bradley-Terry rankings, appends tracked metadata, and saves to CSV in the results folder."""
+        import csv
+        import math
+        import pydicom
+        import json
+
+        n = len(self.pairwise_items)
+        final_ranking = [self.pairwise_items[i] for i in sorted(range(n), key=lambda x: self.bt_p[x], reverse=True)]
+
+        try:
+            # 1. Load tracked metadata parameters from .dat file
+            dat_file_path = self.current_project_path / f"{self.current_project_name}.dat"
+            tracked_tags = []
+            if dat_file_path.exists():
+                with open(dat_file_path, "r", encoding="utf-8") as f:
+                    project_data = json.load(f)
+                    tracked_tags = project_data.get("parameters_tracked", [])
+
+            results_dir = self.current_project_path / "results"
+            results_dir.mkdir(parents=True, exist_ok=True)
+
+            # 2. Prepare CSV header with score metrics followed by tracked tags
+            header = ["Rank", "ImageSet", "LogAbilityScore", "TotalMatches"] + tracked_tags
+
+            rows = []
+            for rank, item in enumerate(final_ranking, start=1):
+                idx = self.item_to_idx[item]
+                log_score = math.log(max(self.bt_p[idx], 1e-6))
+                matches_played = int(sum(self.bt_matches[idx]))
+
+                # 3. Grab metadata from the first valid DICOM file in the image set
+                set_dir = self.current_project_path / item
+                meta_values = {tag: "NA" for tag in tracked_tags}
+                dcm_files = [f for f in set_dir.iterdir() if f.is_file()] if set_dir.exists() else []
+                if dcm_files:
+                    try:
+                        ds = pydicom.dcmread(dcm_files[0], stop_before_pixels=True)
+                        for tag in tracked_tags:
+                            if hasattr(ds, tag):
+                                val = getattr(ds, tag)
+                                meta_values[tag] = str(val) if val is not None else "NA"
+                    except Exception:
+                        pass
+
+                row = [rank, item, f"{log_score:.4f}", matches_played] + [meta_values[tag] for tag in tracked_tags]
+                rows.append(row)
+
+            # 4. Write out to the pairwise result CSV file
+            with open(self.pairwise_result_file, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(rows)
+
+            # Clean up active state file on successful completion
+            if self.pairwise_state_file.exists():
+                self.pairwise_state_file.unlink()
+
+            QMessageBox.information(
+                self, "Evaluation Complete",
+                f"Pair-wise ranking saved successfully to:\n{self.pairwise_result_file.resolve()}"
+            )
+            self._reset_main_window_view()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save results:\n{str(e)}")
+
+
+    def _reset_main_window_view(self):
         """Restores the clean, centered active project dashboard view."""
         from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
         from PySide6.QtCore import Qt
